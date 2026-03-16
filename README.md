@@ -38,7 +38,3 @@ The system expects an `Orders` sheet with the following 17-column structure:
    - Add a new trigger for `updateDelayOrderSheet`.
    - Set it to run on a **Time-driven** event (e.g., Every hour).
 
-## 🔍 Filtering for Pickups
-To view only the orders stuck without tracking for more than 3 days, use this formula in a new sheet:
-```excel
-=IFERROR(FILTER(Orders!A:Q, Orders!K:K="success", Orders!O:O="N/A", Orders!Q:Q="'undefined", INT(Orders!C:C) <= TODAY()-3), "No Pickup Delays Found")
