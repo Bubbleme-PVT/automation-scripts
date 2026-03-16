@@ -12,10 +12,7 @@ function setupSheetHeaders() {
     "Tracking Company", "Tracking Number"
   ];
   
-  // Removed .setFontWeight("bold") from the line below
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  
-  // Keeps the top row frozen for easy scrolling
   sheet.setFrozenRows(1);
 }
 
@@ -23,10 +20,8 @@ function setupSheetHeaders() {
  * STEP 2: The Main Webhook Handler
  */
 function doPost(e) {
-  // --- CONCURRENCY LOCK (Handles Burst Data) ---
   const lock = LockService.getScriptLock();
   try {
-    // Wait for up to 30 seconds for other processes to finish
     lock.waitLock(30000); 
   } catch (e) {
     return ContentService.createTextOutput("Error: Could not obtain lock (Timeout)");
@@ -39,7 +34,6 @@ function doPost(e) {
     if (!e || !e.postData) return;
     const data = JSON.parse(e.postData.contents);
 
-    // --- PRIMARY KEY LOGIC ---
     const primaryKey = String(data.name || data.order_id || "").trim().split('.')[0]; 
     if (!primaryKey) throw new Error("No Unique ID found in payload");
 
@@ -55,29 +49,41 @@ function doPost(e) {
       }
     }
 
-    // --- TOTAL PRICE CALCULATION (Fix for Missing Total) ---
+    // --- TOTAL PRICE CALCULATION ---
     let totalPrice = data.total_price;
     if (!totalPrice && data.line_items) {
-      // Calculate total from line items if top-level price is missing
-      totalPrice = data.line_items.reduce((sum, item) => {
-        return sum + (parseFloat(item.price || 0) * (item.quantity || 1));
-      }, 0);
+      totalPrice = data.line_items.reduce((sum, item) => sum + (parseFloat(item.price || 0) * (item.quantity || 1)), 0);
     }
-    // Fallback to existing data if still 0/null
     totalPrice = totalPrice || (existingRowData[8] || 0);
 
-    // --- STATUS LOGIC ---
-    const existingShipStatus = existingRowData.length > 0 ? existingRowData[14] : "";
-    let shipStatus, fulfillStatus, payStatus;
+    // --- INTEGRATED STATUS & TRACKING LOGIC ---
+    let shipStatus, fulfillStatus, payStatus, carrier, trackingNum;
     
-    if (existingShipStatus === "CANCELLED" || data.cancelled_at || data.cancel_reason) {
+    // Check if order is cancelled
+    if (existingRowData[14] === "CANCELLED" || data.cancelled_at || data.cancel_reason) {
       shipStatus = "CANCELLED";
       fulfillStatus = "CANCELLED";
       payStatus = "voided";
+      carrier = "N/A";
+      trackingNum = "CANCELLED";
     } else {
-      shipStatus = data.shipment_status || data.status || (existingRowData[14] || "N/A");
-      fulfillStatus = data.status || (existingRowData[10] || "unfulfilled");
+      // 1. Determine Payment and Fulfillment Status
       payStatus = data.financial_status || (existingRowData[9] || "pending");
+      fulfillStatus = data.status || (existingRowData[10] || "unfulfilled");
+
+      // 2. Extract Tracking Info from webhook or fallback to existing
+      carrier = data.tracking_company || (data.fulfillments ? data.fulfillments[0]?.tracking_company : (existingRowData[15] || ""));
+      trackingNum = data.tracking_number || (data.fulfillments ? data.fulfillments[0]?.tracking_number : (existingRowData[16] || ""));
+
+      // 3. APPLY CUSTOM PICKUP LOGIC: Success but no tracking
+      if (fulfillStatus === "success" && (!trackingNum || trackingNum === "null" || trackingNum === "undefined" || trackingNum === "")) {
+        shipStatus = "N/A";
+        trackingNum = "undefined"; // Explicitly set per requirement
+        carrier = ""; // Blank if not assigned
+      } else {
+        shipStatus = data.shipment_status || (existingRowData[14] || "N/A");
+        trackingNum = trackingNum || "undefined";
+      }
     }
 
     // --- DATA EXTRACTION ---
@@ -87,10 +93,6 @@ function doPost(e) {
     const email = data.email || existingRowData[5] || "N/A";
     const phone = data.destination?.phone || data.customer?.phone || (existingRowData[6] || "N/A");
     const city = data.destination?.city || existingRowData[13] || "N/A";
-    
-    const carrier = data.tracking_company || (data.fulfillments ? data.fulfillments[0]?.tracking_company : (existingRowData[15] || "N/A"));
-    const trackingNum = data.tracking_number || (data.fulfillments ? data.fulfillments[0]?.tracking_number : (existingRowData[16] || "N/A"));
-    
     const finalOrderID = existingRowData.length > 0 ? existingRowData[0] : primaryKey;
     const finalItems = existingRowData.length > 0 ? existingRowData[11] : (data.line_items ? data.line_items.map(item => item.quantity + "x " + item.title).join(", ") : "N/A");
 
@@ -104,7 +106,7 @@ function doPost(e) {
       email,             // Col 6
       "'" + phone,       // Col 7
       data.source_name || (existingRowData[7] || "web"), // Col 8
-      totalPrice,        // Col 9 (CALCULATED TOTAL)
+      totalPrice,        // Col 9
       payStatus,         // Col 10
       fulfillStatus,     // Col 11
       finalItems,        // Col 12
@@ -130,14 +132,12 @@ function doPost(e) {
     console.error(err.toString());
     return ContentService.createTextOutput("Error: " + err.message);
   } finally {
-    // Release the lock so the next webhook can process
     lock.releaseLock();
   }
 }
 
 /**
  * STEP 3: The Delay Scanner
- * Optimized to prevent the "Ranges must have at least one range" error.
  */
 function updateDelayOrderSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -159,69 +159,48 @@ function updateDelayOrderSheet() {
     if (!rawDate || isNaN(Date.parse(rawDate))) continue;
     
     const orderDate = new Date(rawDate); 
-    const status = String(data[i][14]).trim().toLowerCase();
+    const shipStatus = String(data[i][14]).trim().toLowerCase();
+    const trackNum = String(data[i][16]).trim().toLowerCase();
     
     const diffTime = today.getTime() - orderDate.getTime();
     const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
 
-    if (status !== "delivered" && status !== "cancelled" && diffDays >= 4) {
-      let row = [...data[i]];
-      
-      let flagSymbol = "🟡"; 
-      if (diffDays >= 6) flagSymbol = "🔴";
-      else if (diffDays === 5) flagSymbol = "🟠";
-      
-      row[1] = flagSymbol + " " + diffDays + " Days";
-      delayedRows.push(row);
+    // Logic: If not delivered/cancelled AND (Delayed 4+ days OR Success but undefined tracking)
+    if (shipStatus !== "delivered" && shipStatus !== "cancelled") {
+      if (diffDays >= 4 || trackNum.includes("undefined")) {
+        let row = [...data[i]];
+        
+        // Flag logic
+        let flagSymbol = "🟡"; 
+        if (diffDays >= 6 || (trackNum.includes("undefined") && diffDays >= 3)) flagSymbol = "🔴";
+        else if (diffDays === 5) flagSymbol = "🟠";
+        
+        row[1] = flagSymbol + " " + diffDays + " Days";
+        delayedRows.push(row);
+      }
     }
   }
 
-  // --- CLEANUP ---
   delaySheet.clear(); 
   delaySheet.clearFormats();
-  // Completely clear all rules before starting
   delaySheet.setConditionalFormatRules([]); 
-  
-  // Restore headers
   delaySheet.getRange(1, 1, 1, 17).setValues(headers);
 
-  // --- DATA INJECTION ---
   if (delayedRows.length > 0) {
     const numRows = delayedRows.length;
     const targetRange = delaySheet.getRange(2, 1, numRows, 17);
     targetRange.setValues(delayedRows);
-    
-    // Sort: Oldest first
     targetRange.sort({column: 3, ascending: true});
     
-    // --- FORMATTING FIX ---
-    // Define the specific range for the Flags column
     const flagRange = delaySheet.getRange(2, 2, numRows, 1);
-    
     const newRules = [
-      SpreadsheetApp.newConditionalFormatRule()
-        .whenTextContains("🔴")
-        .setBackground("#FFD1D1")
-        .setRanges([flagRange])
-        .build(),
-      SpreadsheetApp.newConditionalFormatRule()
-        .whenTextContains("🟠")
-        .setBackground("#FFE5CC")
-        .setRanges([flagRange])
-        .build(),
-      SpreadsheetApp.newConditionalFormatRule()
-        .whenTextContains("🟡")
-        .setBackground("#FFFFE0")
-        .setRanges([flagRange])
-        .build()
+      SpreadsheetApp.newConditionalFormatRule().whenTextContains("🔴").setBackground("#FFD1D1").setRanges([flagRange]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextContains("🟠").setBackground("#FFE5CC").setRanges([flagRange]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextContains("🟡").setBackground("#FFFFE0").setRanges([flagRange]).build()
     ];
-    
-    // Apply the rules array directly
     delaySheet.setConditionalFormatRules(newRules);
-    
-    // Format dates
     delaySheet.getRange(2, 3, numRows, 2).setNumberFormat("dd/mm/yyyy hh:mm:ss");
   } else {
-    delaySheet.getRange(2, 1).setValue("No orders currently delayed (4+ days).");
+    delaySheet.getRange(2, 1).setValue("No orders currently delayed.");
   }
 }
