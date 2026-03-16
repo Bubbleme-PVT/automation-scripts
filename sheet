@@ -1,0 +1,227 @@
+/**
+ * STEP 1: Setup the sheet. Run this manually once.
+ */
+function setupSheetHeaders() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("Orders") || ss.insertSheet("Orders");
+  
+  const headers = [
+    "Order ID (PK)", "Flags", "Order Date", "Last Updated", "Customer Name", 
+    "Email", "Phone", "Channel", "Total", "Payment status", 
+    "Fulfillment status", "Items", "Tags", "City", "Shipment Status", 
+    "Tracking Company", "Tracking Number"
+  ];
+  
+  // Removed .setFontWeight("bold") from the line below
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  
+  // Keeps the top row frozen for easy scrolling
+  sheet.setFrozenRows(1);
+}
+
+/**
+ * STEP 2: The Main Webhook Handler
+ */
+function doPost(e) {
+  // --- CONCURRENCY LOCK (Handles Burst Data) ---
+  const lock = LockService.getScriptLock();
+  try {
+    // Wait for up to 30 seconds for other processes to finish
+    lock.waitLock(30000); 
+  } catch (e) {
+    return ContentService.createTextOutput("Error: Could not obtain lock (Timeout)");
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("Orders") || ss.insertSheet("Orders");
+  
+  try {
+    if (!e || !e.postData) return;
+    const data = JSON.parse(e.postData.contents);
+
+    // --- PRIMARY KEY LOGIC ---
+    const primaryKey = String(data.name || data.order_id || "").trim().split('.')[0]; 
+    if (!primaryKey) throw new Error("No Unique ID found in payload");
+
+    const lastRow = sheet.getLastRow();
+    let rowIndex = -1;
+    let existingRowData = [];
+
+    if (lastRow > 1) {
+      const ids = sheet.getRange(2, 1, lastRow, 1).getValues().flat().map(id => String(id).trim());
+      rowIndex = ids.indexOf(primaryKey);
+      if (rowIndex !== -1) {
+        existingRowData = sheet.getRange(rowIndex + 2, 1, 1, 17).getValues()[0];
+      }
+    }
+
+    // --- TOTAL PRICE CALCULATION (Fix for Missing Total) ---
+    let totalPrice = data.total_price;
+    if (!totalPrice && data.line_items) {
+      // Calculate total from line items if top-level price is missing
+      totalPrice = data.line_items.reduce((sum, item) => {
+        return sum + (parseFloat(item.price || 0) * (item.quantity || 1));
+      }, 0);
+    }
+    // Fallback to existing data if still 0/null
+    totalPrice = totalPrice || (existingRowData[8] || 0);
+
+    // --- STATUS LOGIC ---
+    const existingShipStatus = existingRowData.length > 0 ? existingRowData[14] : "";
+    let shipStatus, fulfillStatus, payStatus;
+    
+    if (existingShipStatus === "CANCELLED" || data.cancelled_at || data.cancel_reason) {
+      shipStatus = "CANCELLED";
+      fulfillStatus = "CANCELLED";
+      payStatus = "voided";
+    } else {
+      shipStatus = data.shipment_status || data.status || (existingRowData[14] || "N/A");
+      fulfillStatus = data.status || (existingRowData[10] || "unfulfilled");
+      payStatus = data.financial_status || (existingRowData[9] || "pending");
+    }
+
+    // --- DATA EXTRACTION ---
+    const orderDate = existingRowData.length > 0 ? existingRowData[2] : (data.created_at ? new Date(data.created_at) : new Date());
+    const lastUpdated = new Date(); 
+    const customer = data.destination?.name || (data.customer ? (data.customer.first_name + " " + data.customer.last_name) : (existingRowData[4] || "N/A"));
+    const email = data.email || existingRowData[5] || "N/A";
+    const phone = data.destination?.phone || data.customer?.phone || (existingRowData[6] || "N/A");
+    const city = data.destination?.city || existingRowData[13] || "N/A";
+    
+    const carrier = data.tracking_company || (data.fulfillments ? data.fulfillments[0]?.tracking_company : (existingRowData[15] || "N/A"));
+    const trackingNum = data.tracking_number || (data.fulfillments ? data.fulfillments[0]?.tracking_number : (existingRowData[16] || "N/A"));
+    
+    const finalOrderID = existingRowData.length > 0 ? existingRowData[0] : primaryKey;
+    const finalItems = existingRowData.length > 0 ? existingRowData[11] : (data.line_items ? data.line_items.map(item => item.quantity + "x " + item.title).join(", ") : "N/A");
+
+    // --- ASSEMBLE ROW ---
+    const rowData = [
+      finalOrderID,      // Col 1
+      "low",             // Col 2
+      orderDate,         // Col 3
+      lastUpdated,       // Col 4
+      customer,          // Col 5
+      email,             // Col 6
+      "'" + phone,       // Col 7
+      data.source_name || (existingRowData[7] || "web"), // Col 8
+      totalPrice,        // Col 9 (CALCULATED TOTAL)
+      payStatus,         // Col 10
+      fulfillStatus,     // Col 11
+      finalItems,        // Col 12
+      data.tags || (existingRowData[12] || ""),          // Col 13
+      city,              // Col 14
+      shipStatus,        // Col 15
+      carrier,           // Col 16
+      "'" + trackingNum  // Col 17
+    ];
+
+    if (rowIndex !== -1) {
+      sheet.getRange(rowIndex + 2, 1, 1, rowData.length).setValues([rowData]);
+    } else {
+      sheet.insertRowAfter(1);
+      sheet.getRange(2, 1, 1, rowData.length).setValues([rowData]);
+    }
+
+    sheet.getRange(2, 3, sheet.getLastRow() > 1 ? sheet.getLastRow() - 1 : 1, 2).setNumberFormat("dd/mm/yyyy hh:mm:ss am/pm");
+
+    return ContentService.createTextOutput("Success - PK: " + primaryKey);
+
+  } catch (err) {
+    console.error(err.toString());
+    return ContentService.createTextOutput("Error: " + err.message);
+  } finally {
+    // Release the lock so the next webhook can process
+    lock.releaseLock();
+  }
+}
+
+/**
+ * STEP 3: The Delay Scanner
+ * Optimized to prevent the "Ranges must have at least one range" error.
+ */
+function updateDelayOrderSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sourceSheet = ss.getSheetByName("Orders");
+  const delaySheet = ss.getSheetByName("Delay_Order") || ss.insertSheet("Delay_Order");
+  
+  if (!sourceSheet) return;
+
+  const lastRow = sourceSheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const data = sourceSheet.getRange(2, 1, lastRow - 1, 17).getValues();
+  const headers = sourceSheet.getRange(1, 1, 1, 17).getValues();
+  const today = new Date();
+  const delayedRows = [];
+
+  for (let i = 0; i < data.length; i++) {
+    const rawDate = data[i][2];
+    if (!rawDate || isNaN(Date.parse(rawDate))) continue;
+    
+    const orderDate = new Date(rawDate); 
+    const status = String(data[i][14]).trim().toLowerCase();
+    
+    const diffTime = today.getTime() - orderDate.getTime();
+    const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+    if (status !== "delivered" && status !== "cancelled" && diffDays >= 4) {
+      let row = [...data[i]];
+      
+      let flagSymbol = "🟡"; 
+      if (diffDays >= 6) flagSymbol = "🔴";
+      else if (diffDays === 5) flagSymbol = "🟠";
+      
+      row[1] = flagSymbol + " " + diffDays + " Days";
+      delayedRows.push(row);
+    }
+  }
+
+  // --- CLEANUP ---
+  delaySheet.clear(); 
+  delaySheet.clearFormats();
+  // Completely clear all rules before starting
+  delaySheet.setConditionalFormatRules([]); 
+  
+  // Restore headers
+  delaySheet.getRange(1, 1, 1, 17).setValues(headers);
+
+  // --- DATA INJECTION ---
+  if (delayedRows.length > 0) {
+    const numRows = delayedRows.length;
+    const targetRange = delaySheet.getRange(2, 1, numRows, 17);
+    targetRange.setValues(delayedRows);
+    
+    // Sort: Oldest first
+    targetRange.sort({column: 3, ascending: true});
+    
+    // --- FORMATTING FIX ---
+    // Define the specific range for the Flags column
+    const flagRange = delaySheet.getRange(2, 2, numRows, 1);
+    
+    const newRules = [
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextContains("🔴")
+        .setBackground("#FFD1D1")
+        .setRanges([flagRange])
+        .build(),
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextContains("🟠")
+        .setBackground("#FFE5CC")
+        .setRanges([flagRange])
+        .build(),
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextContains("🟡")
+        .setBackground("#FFFFE0")
+        .setRanges([flagRange])
+        .build()
+    ];
+    
+    // Apply the rules array directly
+    delaySheet.setConditionalFormatRules(newRules);
+    
+    // Format dates
+    delaySheet.getRange(2, 3, numRows, 2).setNumberFormat("dd/mm/yyyy hh:mm:ss");
+  } else {
+    delaySheet.getRange(2, 1).setValue("No orders currently delayed (4+ days).");
+  }
+}
